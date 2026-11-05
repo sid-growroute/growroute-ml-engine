@@ -1,0 +1,20 @@
+run_id: "yolo-dfw-v1"
+model:
+  weights_pt: "models/pool_spa_dfw_v1.pt"
+  weights_onnx: "models/pool_spa_dfw_v1.onnx"
+  imgsz: 640
+  conf_threshold: 0.45
+  iou_threshold: 0.50
+  hard_negative_range: [0.25, 0.44]  # Auto-saved for Texas v2 retraining
+
+classes:
+  0: "pool"
+  1: "spa"
+
+canopy:
+  buffer_meters: 15.0                # 15m leaf-drop ring around detected pool
+  overhang_threshold_pct: 35.0       # Sets tree_overhang = true when >= 35%
+
+s3:
+  bucket: "growroute-naip-tiles"
+  prefix: "tx/h3_res9"
