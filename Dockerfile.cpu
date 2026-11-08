@@ -1,0 +1,46 @@
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    OMP_NUM_THREADS=6
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgl1 \
+    libglib2.0-0 \
+    libgomp1 \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir \
+    "numpy==1.26.4" \
+    "torch==2.2.2+cpu" \
+    "torchvision==0.17.2+cpu" \
+    --extra-index-url https://download.pytorch.org/whl/cpu
+
+RUN pip install --no-cache-dir \
+    "rasterio>=1.3.10,<1.5.0" \
+    "onnx>=1.15.0,<1.18.0" \
+    "onnxruntime>=1.19.0,<1.24.0" \
+    "opencv-python-headless<4.11.0" \
+    "ultralytics>=8.3.0" \
+    "h3>=3.7.7,<4.0.0" \
+    "shapely>=2.0.4" \
+    "boto3>=1.34.0" \
+    "requests>=2.31.0" \
+    "supabase>=2.7.0" \
+    "python-dotenv>=1.0.1" \
+    "pyyaml>=6.0.1" \
+    "tqdm>=4.66.0" \
+    "numpy==1.26.4"
+
+# Copy ONNX weights, configs, and source code into the container
+COPY models/pool_spa_dfw_v2.onnx ./models/pool_spa_dfw_v2.onnx
+COPY configs/ ./configs/
+COPY src/ ./src/
+
+RUN mkdir -p /app/tiles_cache /app/runs
+
+ENTRYPOINT ["python", "-m", "src.run_pipeline"]

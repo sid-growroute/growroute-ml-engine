@@ -1,0 +1,9 @@
+.venv/
+.git/
+__pycache__/
+*.pyc
+.env
+data/
+tiles_cache/
+runs/
+models/*.pt

@@ -30,13 +30,13 @@ def resolve_roboflow_yaml(dataset_dir: Path) -> Path:
 
 def main():
     parser = argparse.ArgumentParser(description="Train Pool & Spa YOLO on SSD + export ONNX")
-    parser.add_argument("--dataset", required=True, help="Path inside ./data (e.g. data/pool_spa_dfw_v1)")
+    parser.add_argument("--dataset", required=True, help="Path inside ./data (e.g. data/pool_spa_dfw_v2)")
     parser.add_argument("--base-model", default="yolov8s.pt", help="Base YOLO checkpoint")
     parser.add_argument("--epochs", type=int, default=80)
     parser.add_argument("--imgsz", type=int, default=640)
     parser.add_argument("--batch", type=int, default=16)
     parser.add_argument("--device", default="mps", help="mps (Mac mini), 0 (CUDA GPU), or cpu")
-    parser.add_argument("--export-name", default="pool_spa_dfw_v1", help="Output model name in ./models/")
+    parser.add_argument("--export-name", default="pool_spa_dfw_v2", help="Output model name in ./models/")
     args = parser.parse_args()
 
     dataset_dir = Path(args.dataset)

@@ -1,12 +1,19 @@
 run_id: "yolo-dfw-v1"
 model:
-  weights_pt: "models/pool_spa_dfw_v1.pt"
-  weights_onnx: "models/pool_spa_dfw_v1.onnx"
+  weights_pt: "models/pool_spa_dfw_v2.pt"
+  weights_onnx: "models/pool_spa_dfw_v2.onnx"
   imgsz: 640
   conf_threshold: 0.45
   iou_threshold: 0.50
   hard_negative_range: [0.25, 0.44]  # Auto-saved for Texas v2 retraining
 
+storage:
+  s3_bucket: "growroute-naip-tiles"
+  s3_prefix: "tx/h3_res9"
+  local_cache_dir: "./tiles_cache"
+  runs_dir: "./runs"
+  file_ext: ".tif"
+  
 classes:
   0: "pool"
   1: "spa"
