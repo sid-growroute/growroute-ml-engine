@@ -95,8 +95,10 @@ def main():
                     "p_run_id": cfg["run_id"],
                 },
             ).execute()
-            if rpc_res.data and isinstance(rpc_res.data, dict):
-                total_matched += rpc_res.data.get("matched_detections", 0)
+            if isinstance(rpc_res.data, int):
+                total_matched += rpc_res.data
+            elif isinstance(rpc_res.data, dict):
+                total_matched += int(rpc_res.data.get("matched_detections", 0))
 
         # 5. Optional cleanup when running on small-disk AWS instances
         if args.ephemeral_cache:

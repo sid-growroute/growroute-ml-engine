@@ -185,7 +185,8 @@ def process_next_queued_job(
 
 
 def main():
-    load_dotenv()
+    repo_root = Path(__file__).resolve().parents[1]
+    load_dotenv(repo_root / ".env")
     parser = argparse.ArgumentParser(description="GrowRoute County Pipeline Orchestrator")
     parser.add_argument(
         "--executor",
@@ -211,7 +212,7 @@ def main():
     )
     worker_id = f"{socket.gethostname()}-{args.executor}"
     nas_root = Path(args.nas_root).resolve()
-    env_file = Path(".env").resolve()
+    env_file = (repo_root / ".env").resolve()
 
     while True:
         # 1. Always prioritize queued Parcel jobs before ML jobs

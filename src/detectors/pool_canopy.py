@@ -22,10 +22,10 @@ class TileGeoContext:
         """Converts image pixel (x, y) to EPSG:4326 (lng, lat) using GeoTIFF affine transform + CRS."""
         if self.affine is not None and self.crs is not None:
             # rasterio.transform.xy takes (row=y, col=x)
-            xs, ys = rasterio.transform.xy(self.affine, [y_px], [x_px])
+            x, y = rasterio.transform.xy(self.affine, y_px, x_px)
             if str(self.crs).upper() in ("EPSG:4326", "WGS84"):
-                return float(xs[0]), float(ys[0])
-            lngs, lats = warp_transform(self.crs, "EPSG:4326", xs, ys)
+                return float(x), float(y)
+            lngs, lats = warp_transform(self.crs, "EPSG:4326", [float(x)], [float(y)])
             return float(lngs[0]), float(lats[0])
 
         west, south, east, north = self.fallback_bounds
@@ -164,7 +164,7 @@ class PoolSpaCanopyDetector:
         conf_threshold: float = 0.45,
         hard_neg_range: Tuple[float, float] = (0.25, 0.44),
     ):
-        self.model = YOLO(weights_path)
+        self.model = YOLO(weights_path, task="segment")
         self.device = device
         self.conf_threshold = conf_threshold
         self.hard_neg_min, self.hard_neg_max = hard_neg_range
@@ -197,12 +197,12 @@ class PoolSpaCanopyDetector:
 
         for box in preds.boxes:
             cls_id = int(box.cls[0].item())
-            conf = round(float(box.conf[0].item()), 3)
+            conf = round(min(max(float(box.conf[0].item()), 0.0), 1.0), 3)
             x1, y1, x2, y2 = [int(round(v)) for v in box.xyxy[0].tolist()]
 
             # Borderline detection -> queue for Roboflow hard-negative .jpg export
             if conf < self.conf_threshold:
-                if self.hard_neg_min <= conf <= self.hard_neg_max:
+                if self.hard_neg_min <= conf <= self.hard_neg_max and cls_id in (0, 1):
                     nx, ny, nw, nh = [round(float(v), 6) for v in box.xywhn[0].tolist()]
                     hard_neg_boxes.append({
                         "cls_id": cls_id,
@@ -214,6 +214,8 @@ class PoolSpaCanopyDetector:
             cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
             if cls_id == 1:  # Spa
                 spa_centers.append((cx, cy))
+                continue
+            if cls_id != 0:  # Pool is class 0
                 continue
 
             lng, lat = geo_ctx.pixel_to_lnglat(cx, cy)

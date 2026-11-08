@@ -43,7 +43,7 @@ def main():
     resolved_yaml = resolve_roboflow_yaml(dataset_dir)
     runs_dir = Path("./runs").resolve()
 
-    model = YOLO(args.base_model)
+    model = YOLO(args.base_model, task="segment")
     results = model.train(
         data=str(resolved_yaml),
         epochs=args.epochs,
@@ -64,7 +64,7 @@ def main():
     print(f"Saved PyTorch weights -> {target_pt}")
 
     # Export ONNX for fast CPU EC2 staging
-    best_model = YOLO(str(target_pt))
+    best_model = YOLO(str(target_pt), task="segment")
     onnx_path = best_model.export(format="onnx", imgsz=args.imgsz, simplify=True)
     target_onnx = models_dir / f"{args.export_name}.onnx"
     if Path(onnx_path).exists() and Path(onnx_path) != target_onnx:
