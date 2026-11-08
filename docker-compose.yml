@@ -1,0 +1,15 @@
+services:
+  ml-worker:
+    image: growroute-ml:cpu
+    build:
+      context: .
+      dockerfile: Dockerfile.cpu
+    env_file:
+      - .env
+    environment:
+      - OMP_NUM_THREADS=2
+      - TILE_LOADER_WORKERS=4
+    mem_limit: 2560m
+    volumes:
+      - /Volumes/GrowrouteLLC/growroute-data/ml/naip_h3_tiles:/app/tiles_cache
+      - /Volumes/GrowrouteLLC/growroute-data/ml/training_runs:/app/runs

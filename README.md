@@ -62,14 +62,18 @@ growroute-ml-engine/
 ├── .dockerignore                # Excludes .venv, local caches, and .pt weights from Docker context
 ├── Dockerfile.cpu               # Local/Staging ONNX Runtime CPU container (growroute-ml:cpu)
 ├── Dockerfile.gpu               # AWS Batch CUDA 12.1 + ONNX Runtime GPU container (growroute-ml:gpu)
+├── docker-compose.yml           # Compose service definition for ml-worker (2560m limit, NAS mounts)
+├── Makefile                     # Shortcuts: make build-cpu, make queue-dfw, make run-parallel
 ├── requirements.txt             # Python dependencies (ultralytics, rasterio, onnxruntime, h3, supabase)
+├── scripts/
+│   └── run_parallel_dfw.sh      # Helper script to launch parallel multi-county Docker workers
 ├── configs/
 │   └── pipeline.yaml            # Model paths, confidence thresholds, canopy buffer (15m), S3 config
 ├── models/
 │   ├── pool_spa_dfw_v2.onnx     # Production YOLO11s-seg ONNX model (input: 640x640, classes: pool, spa)
 │   └── pool_spa_dfw_v2.pt       # PyTorch YOLO11s-seg checkpoint
 ├── src/
-│   ├── orchestrator.py          # Queue worker polling public.county_lookup (docker-local / aws-batch)
+│   ├── orchestrator.py          # Multi-worker ThreadPoolExecutor polling public.county_lookup
 │   ├── run_pipeline.py          # Per-county worker: fetches H3 cells, runs YOLO + Canopy, flushes RPCs
 │   ├── dry_run_local.py         # Offline smoke-test script on local .tif/.jpg tiles (no DB writes)
 │   ├── detectors/
@@ -188,13 +192,16 @@ SET run_ml = true,
     last_pipeline_error = NULL;
 ```
 
-**Step B — Start the Orchestrator:**
+**Step B — Start the Parallel Orchestrator (`--max-workers 3`):**
 ```bash
 ./.venv/bin/python3 -m src.orchestrator \
   --executor docker-local \
+  --max-workers 3 \
   --nas-root /Volumes/GrowrouteLLC/growroute-data
 ```
-*(Optional: append `--watch` to keep the orchestrator polling `public.county_lookup` every 30 seconds.)*
+*(Or use `./scripts/run_parallel_dfw.sh` or `make run-parallel MAX_WORKERS=3`. Append `--watch` to keep polling `public.county_lookup` every 30 seconds.)*
+
+* **Mac mini Resource Protection:** `src/orchestrator.py` dynamically scales `OMP_NUM_THREADS = max(1, 6 // max_workers)` (`2` threads per container when `max_workers=3`), sets `TILE_LOADER_WORKERS=4`, and caps each container at `--memory=2560m`, streaming prefixed output lines (`[COLLIN | 48085] ...`).
 
 ---
 

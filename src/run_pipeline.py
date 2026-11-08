@@ -56,14 +56,22 @@ def main():
     ).execute()
     h3_cells = [row["h3_index_res9"] for row in (resp.data or [])]
     if not h3_cells:
-        print(f"No unscanned H3 cells remaining for {args.county.upper()}.")
+        print(f"No unscanned H3 cells remaining for {args.county.upper()}.", flush=True)
         return
 
+    batches = list(chunk_list(h3_cells, args.batch_tiles))
+    print(
+        f"Starting {args.county.upper()} scan: {len(h3_cells)} unscanned H3 cells "
+        f"across {len(batches)} batch(es) (batch_tiles={args.batch_tiles}).",
+        flush=True,
+    )
+
     total_matched = 0
-    for h3_batch in tqdm(list(chunk_list(h3_cells, args.batch_tiles)), desc=f"Batches ({args.county.upper()})"):
+    for batch_idx, h3_batch in enumerate(batches, start=1):
         # 2. Read from SSD cache or parallel-download .tif files from S3
         tile_map = s3_loader.fetch_batch(h3_batch, county=args.county)
         if not tile_map:
+            print(f"Batch {batch_idx}/{len(batches)}: 0 tiles resolved, skipping.", flush=True)
             continue
 
         scanned_h3 = []
@@ -83,9 +91,10 @@ def main():
                 if hard_negs:
                     miner.save_candidate(h3_idx, args.county, img_bgr, hard_negs)
             except Exception as exc:
-                print(f"Skipping corrupted tile {h3_idx}: {exc}")
+                print(f"Skipping corrupted tile {h3_idx}: {exc}", flush=True)
 
         # 4. Flush batch to PostGIS ingest_ml_detections RPC
+        batch_matched = 0
         if scanned_h3:
             rpc_res = supabase.rpc(
                 "ingest_ml_detections",
@@ -96,9 +105,17 @@ def main():
                 },
             ).execute()
             if isinstance(rpc_res.data, int):
-                total_matched += rpc_res.data
+                batch_matched = rpc_res.data
             elif isinstance(rpc_res.data, dict):
-                total_matched += int(rpc_res.data.get("matched_detections", 0))
+                batch_matched = int(rpc_res.data.get("matched_detections", 0))
+            total_matched += batch_matched
+
+        print(
+            f"Batch {batch_idx}/{len(batches)} complete: scanned={len(scanned_h3)} tiles, "
+            f"detections={len(detections)}, matched_parcels={batch_matched} "
+            f"(cumulative_matched={total_matched})",
+            flush=True,
+        )
 
         # 5. Optional cleanup when running on small-disk AWS instances
         if args.ephemeral_cache:
@@ -111,7 +128,8 @@ def main():
     ).execute()
     print(
         f"Done! Matched {total_matched} pools in {args.county.upper()} "
-        f"and saved {miner.saved_count} Roboflow hard-negative .jpg tiles."
+        f"and saved {miner.saved_count} Roboflow hard-negative .jpg tiles.",
+        flush=True,
     )
 
 

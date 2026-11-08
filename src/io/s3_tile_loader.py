@@ -29,7 +29,7 @@ class S3TileLoader:
         s3_prefix: str = "tx/h3_res9",
         cache_dir: str = "./tiles_cache",
         file_ext: str = ".tif",
-        max_workers: int = 8,
+        max_workers: Optional[int] = None,
         enable_public_naip_fallback: bool = True,
     ):
         self.bucket = bucket
@@ -37,7 +37,9 @@ class S3TileLoader:
         self.cache_dir = Path(cache_dir).resolve()
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.file_ext = file_ext if file_ext.startswith(".") else f".{file_ext}"
-        self.max_workers = max_workers
+        if max_workers is None:
+            max_workers = int(os.getenv("TILE_LOADER_WORKERS", "4"))
+        self.max_workers = max(1, int(max_workers))
         self.enable_public_naip_fallback = enable_public_naip_fallback
 
         self.s3_client = boto3.client(
@@ -53,11 +55,14 @@ class S3TileLoader:
 
     def _refresh_local_index(self) -> None:
         for ext in (".tif", ".tiff", ".jpg", ".png"):
-            for path in self.cache_dir.rglob(f"*{ext}"):
-                if path.name.startswith("."):
-                    continue
-                h3_key = path.stem.split("_")[-1]
-                self._local_index[h3_key] = path
+            try:
+                for path in self.cache_dir.rglob(f"*{ext}"):
+                    if path.name.startswith("."):
+                        continue
+                    h3_key = path.stem.split("_")[-1]
+                    self._local_index[h3_key] = path
+            except OSError:
+                continue
 
     def _find_cached_tile(self, h3_index: str) -> Optional[Path]:
         path = self._local_index.get(h3_index)
@@ -82,67 +87,70 @@ class S3TileLoader:
         Queries the public USDA NAIP STAC catalog for the H3 cell's bounding box,
         crops the 4-band RGB+NIR GeoTIFF window, and saves it directly to the NAS.
         """
-        try:
-            # 1. Compute H3 bounding box in EPSG:4326 with a ~35m collar so edge pools aren't clipped
-            boundary = h3.h3_to_geo_boundary(h3_index, geo_json=True)
-            lngs = [pt[0] for pt in boundary]
-            lats = [pt[1] for pt in boundary]
-            pad = 0.00035
-            bbox_wgs84 = [min(lngs) - pad, min(lats) - pad, max(lngs) + pad, max(lats) + pad]
+        boundary = h3.h3_to_geo_boundary(h3_index, geo_json=True)
+        lngs = [pt[0] for pt in boundary]
+        lats = [pt[1] for pt in boundary]
+        pad = 0.00035
+        bbox_wgs84 = [min(lngs) - pad, min(lats) - pad, max(lngs) + pad, max(lats) + pad]
 
-            # 2. Find the latest Texas NAIP COG covering this H3 cell
-            search_resp = requests.post(
-                self.STAC_SEARCH_URL,
-                json={
-                    "collections": ["naip"],
-                    "bbox": bbox_wgs84,
-                    "limit": 1,
-                    "sortby": [{"field": "properties.datetime", "direction": "desc"}],
-                },
-                timeout=15,
-            )
-            search_resp.raise_for_status()
-            features = search_resp.json().get("features", [])
-            if not features:
-                return None
-
-            href = features[0]["assets"]["image"]["href"]
-            token = self._get_naip_sas_token()
-            signed_url = f"{href}?{token}"
-
-            # 3. Stream only the H3 window from the remote COG and write it to the Synology NAS
-            with rasterio.open(signed_url) as src:
-                left, bottom, right, top = transform_bounds(
-                    "EPSG:4326", src.crs, *bbox_wgs84, densify_pts=21
+        for attempt in range(3):
+            try:
+                # Find the latest Texas NAIP COG covering this H3 cell
+                search_resp = requests.post(
+                    self.STAC_SEARCH_URL,
+                    json={
+                        "collections": ["naip"],
+                        "bbox": bbox_wgs84,
+                        "limit": 1,
+                        "sortby": [{"field": "properties.datetime", "direction": "desc"}],
+                    },
+                    timeout=15,
                 )
-                window = from_bounds(left, bottom, right, top, transform=src.transform)
-                window = window.round_offsets().round_lengths()
+                search_resp.raise_for_status()
+                features = search_resp.json().get("features", [])
+                if not features:
+                    return None
 
-                data = src.read(window=window, boundless=True, fill_value=0)
-                win_transform = src.window_transform(window)
+                href = features[0]["assets"]["image"]["href"]
+                token = self._get_naip_sas_token()
+                signed_url = f"{href}?{token}"
 
-                profile = src.profile.copy()
-                profile.update(
-                    driver="GTiff",
-                    height= int(window.height),
-                    width=int(window.width),
-                    count=src.count,
-                    transform=win_transform,
-                    compress="deflate",
-                    tiled=False,
-                )
+                # Stream only the H3 window from the remote COG and write it to the Synology NAS
+                with rasterio.open(signed_url) as src:
+                    left, bottom, right, top = transform_bounds(
+                        "EPSG:4326", src.crs, *bbox_wgs84, densify_pts=21
+                    )
+                    window = from_bounds(left, bottom, right, top, transform=src.transform)
+                    window = window.round_offsets().round_lengths()
 
-                local_path.parent.mkdir(parents=True, exist_ok=True)
-                with rasterio.open(local_path, "w", **profile) as dst:
-                    dst.write(data)
+                    data = src.read(window=window, boundless=True, fill_value=0)
+                    win_transform = src.window_transform(window)
 
-            if local_path.exists() and local_path.stat().st_size > 0:
-                with self._lock:
-                    self._local_index[h3_index] = local_path
-                return local_path
+                    profile = src.profile.copy()
+                    profile.update(
+                        driver="GTiff",
+                        height=int(window.height),
+                        width=int(window.width),
+                        count=src.count,
+                        transform=win_transform,
+                        compress="deflate",
+                        tiled=False,
+                    )
 
-        except Exception as exc:
-            print(f"[NAIP Pull Warn] Failed to fetch {h3_index}: {exc}")
+                    local_path.parent.mkdir(parents=True, exist_ok=True)
+                    with rasterio.open(local_path, "w", **profile) as dst:
+                        dst.write(data)
+
+                if local_path.exists() and local_path.stat().st_size > 0:
+                    with self._lock:
+                        self._local_index[h3_index] = local_path
+                    return local_path
+
+            except Exception as exc:
+                if attempt < 2:
+                    time.sleep(1.5 * (attempt + 1))
+                else:
+                    print(f"[NAIP Pull Warn] Failed to fetch {h3_index}: {exc}", flush=True)
 
         return None
 

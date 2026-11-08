@@ -1,12 +1,23 @@
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 from pathlib import Path
+import re
 import socket
 import subprocess
+import threading
 import time
 import boto3
 from dotenv import load_dotenv
 from supabase import create_client
+
+_PRINT_LOCK = threading.Lock()
+
+
+def log_prefixed(county_name: str, county_fips: str, message: str) -> None:
+    prefix = f"[{county_name.upper()} | {county_fips}]"
+    with _PRINT_LOCK:
+        print(f"{prefix} {message}", flush=True)
 
 
 def verify_nas_root(nas_root: Path) -> None:
@@ -21,46 +32,107 @@ def verify_nas_root(nas_root: Path) -> None:
     (nas_root / "parcels").mkdir(parents=True, exist_ok=True)
 
 
+def _slugify(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", name.strip().lower()).strip("-")
+
+
+def _stream_docker_container(
+    cmd: list[str],
+    county_name: str,
+    county_fips: str,
+) -> None:
+    """Runs a docker command and streams stdout/stderr line-by-line with county prefix."""
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    assert proc.stdout is not None
+    for raw_line in proc.stdout:
+        line = raw_line.replace("\r", "\n").strip()
+        if not line:
+            continue
+        for subline in line.splitlines():
+            clean = subline.strip()
+            if clean:
+                log_prefixed(county_name, county_fips, clean)
+
+    return_code = proc.wait()
+    if return_code != 0:
+        raise subprocess.CalledProcessError(return_code, cmd)
+
+
 def run_parcel_docker_container(
     county_name: str,
     county_fips: str,
     state_code: str,
     nas_root: Path,
     env_file: Path,
+    omp_threads: int = 2,
     docker_image: str = "growroute-parcel:latest",
 ) -> None:
     """Spins up a Docker container for a single county parcel ingestion run using NAS storage."""
+    county_slug = _slugify(county_name)
+    container_name = f"growroute-parcel-{county_slug}-{county_fips}"
+    subprocess.run(
+        ["docker", "rm", "-f", container_name],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+
     parcels_mount = f"{nas_root / 'parcels'}:/app/data_nas"
     cmd = [
         "docker", "run", "--rm",
-        "--name", f"growroute-parcel-{county_name.lower()}",
+        "--name", container_name,
+        "--memory=2560m",
         "--env-file", str(env_file),
-        "-e", "OMP_NUM_THREADS=6",
+        "-e", f"OMP_NUM_THREADS={omp_threads}",
         "-v", parcels_mount,
         docker_image,
         "--county", county_name.upper(),
         "--fips", county_fips,
         "--state", state_code.upper(),
     ]
-    print(f"[Parcel Docker] Starting {county_name.upper()} ({county_fips})...")
-    subprocess.run(cmd, check=True)
+    log_prefixed(
+        county_name,
+        county_fips,
+        f"Starting Parcel container {container_name} (OMP_NUM_THREADS={omp_threads}, mem=2560m)...",
+    )
+    _stream_docker_container(cmd, county_name, county_fips)
 
 
 def run_ml_docker_container(
     county_name: str,
+    county_fips: str,
     max_tiles: int,
     nas_root: Path,
     env_file: Path,
+    omp_threads: int = 2,
+    tile_loader_workers: int = 4,
     docker_image: str = "growroute-ml:cpu",
 ) -> None:
     """Spins up a Docker container for a single county ML scan using NAS storage."""
+    county_slug = _slugify(county_name)
+    container_name = f"growroute-ml-{county_slug}-{county_fips}"
+    subprocess.run(
+        ["docker", "rm", "-f", container_name],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+
     tiles_mount = f"{nas_root / 'ml' / 'naip_h3_tiles'}:/app/tiles_cache"
     runs_mount = f"{nas_root / 'ml' / 'training_runs'}:/app/runs"
     cmd = [
         "docker", "run", "--rm",
-        "--name", f"growroute-ml-{county_name.lower()}",
+        "--name", container_name,
+        "--memory=2560m",
         "--env-file", str(env_file),
-        "-e", "OMP_NUM_THREADS=6",
+        "-e", f"OMP_NUM_THREADS={omp_threads}",
+        "-e", f"TILE_LOADER_WORKERS={tile_loader_workers}",
         "-v", tiles_mount,
         "-v", runs_mount,
         docker_image,
@@ -69,8 +141,13 @@ def run_ml_docker_container(
         "--batch-tiles", "100",
         "--max-tiles", str(max_tiles),
     ]
-    print(f"[ML Docker] Starting {county_name.upper()} (max_tiles={max_tiles})...")
-    subprocess.run(cmd, check=True)
+    log_prefixed(
+        county_name,
+        county_fips,
+        f"Starting ML container {container_name} (max_tiles={max_tiles}, "
+        f"OMP_NUM_THREADS={omp_threads}, TILE_LOADER_WORKERS={tile_loader_workers}, mem=2560m)...",
+    )
+    _stream_docker_container(cmd, county_name, county_fips)
 
 
 def submit_aws_batch_job(
@@ -115,6 +192,8 @@ def process_next_queued_job(
     worker_id: str,
     nas_root: Path,
     env_file: Path,
+    omp_threads: int = 2,
+    tile_loader_workers: int = 4,
 ) -> bool:
     """Claims and executes 1 job for the given pipeline ('parcel' or 'ml'). Returns True if a job ran."""
     resp = supabase.rpc(
@@ -133,7 +212,6 @@ def process_next_queued_job(
 
     try:
         if executor == "docker-local":
-            verify_nas_root(nas_root)
             if pipeline == "parcel":
                 run_parcel_docker_container(
                     county_name=county_name,
@@ -141,13 +219,17 @@ def process_next_queued_job(
                     state_code=state_code,
                     nas_root=nas_root,
                     env_file=env_file,
+                    omp_threads=omp_threads,
                 )
             else:
                 run_ml_docker_container(
                     county_name=county_name,
+                    county_fips=county_fips,
                     max_tiles=max_tiles,
                     nas_root=nas_root,
                     env_file=env_file,
+                    omp_threads=omp_threads,
+                    tile_loader_workers=tile_loader_workers,
                 )
         else:
             job_id = submit_aws_batch_job(
@@ -156,7 +238,11 @@ def process_next_queued_job(
                 county_fips=county_fips,
                 max_tiles=max_tiles,
             )
-            print(f"[AWS Batch] Dispatched {pipeline.upper()} for {county_name} -> Job {job_id}")
+            log_prefixed(
+                county_name,
+                county_fips,
+                f"[AWS Batch] Dispatched {pipeline.upper()} -> Job {job_id}",
+            )
 
         supabase.rpc(
             "complete_county_job",
@@ -166,7 +252,7 @@ def process_next_queued_job(
                 "p_success": True,
             },
         ).execute()
-        print(f"[Completed] {pipeline.upper()} finished for {county_name} ({county_fips}).")
+        log_prefixed(county_name, county_fips, f"[Completed] {pipeline.upper()} finished successfully.")
 
     except Exception as exc:
         err_msg = str(exc)[:500]
@@ -179,7 +265,7 @@ def process_next_queued_job(
                 "p_error_msg": err_msg,
             },
         ).execute()
-        print(f"[Failed] {pipeline.upper()} failed for {county_name} ({county_fips}): {err_msg}")
+        log_prefixed(county_name, county_fips, f"[Failed] {pipeline.upper()} failed: {err_msg}")
 
     return True
 
@@ -192,7 +278,13 @@ def main():
         "--executor",
         choices=["docker-local", "aws-batch"],
         default="docker-local",
-        help="Run sequentially in local Docker w/ Synology NAS or submit to AWS Batch",
+        help="Run in local Docker w/ Synology NAS or submit to AWS Batch",
+    )
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=3,
+        help="Maximum parallel county containers (default: 3, configurable up to 5)",
     )
     parser.add_argument(
         "--nas-root",
@@ -206,31 +298,73 @@ def main():
     )
     args = parser.parse_args()
 
-    supabase = create_client(
-        os.environ["SUPABASE_URL"],
-        os.environ["SUPABASE_SERVICE_ROLE_KEY"],
-    )
-    worker_id = f"{socket.gethostname()}-{args.executor}"
+    max_workers = max(1, min(args.max_workers, 5))
+    omp_threads = max(1, 6 // max_workers)
+    tile_loader_workers = int(os.getenv("TILE_LOADER_WORKERS", "4"))
+
     nas_root = Path(args.nas_root).resolve()
     env_file = (repo_root / ".env").resolve()
 
-    while True:
-        # 1. Always prioritize queued Parcel jobs before ML jobs
-        ran_parcel = process_next_queued_job(
-            supabase, "parcel", args.executor, worker_id, nas_root, env_file
-        )
-        if ran_parcel:
-            continue
+    if args.executor == "docker-local":
+        verify_nas_root(nas_root)
 
-        # 2. Run queued ML jobs next
-        ran_ml = process_next_queued_job(
-            supabase, "ml", args.executor, worker_id, nas_root, env_file
+    hostname = socket.gethostname()
+    print(
+        f"[Orchestrator] Executor={args.executor} | max_workers={max_workers} | "
+        f"OMP_NUM_THREADS={omp_threads} | TILE_LOADER_WORKERS={tile_loader_workers} | "
+        f"container_mem=2560m",
+        flush=True,
+    )
+
+    def worker_loop(worker_idx: int) -> int:
+        sb = create_client(
+            os.environ["SUPABASE_URL"],
+            os.environ["SUPABASE_SERVICE_ROLE_KEY"],
         )
-        if ran_ml:
-            continue
+        worker_id = f"{hostname}-{args.executor}-w{worker_idx}"
+        jobs_ran = 0
+        while True:
+            # 1. Prioritize queued Parcel jobs before ML jobs
+            ran_parcel = process_next_queued_job(
+                supabase=sb,
+                pipeline="parcel",
+                executor=args.executor,
+                worker_id=worker_id,
+                nas_root=nas_root,
+                env_file=env_file,
+                omp_threads=omp_threads,
+                tile_loader_workers=tile_loader_workers,
+            )
+            if ran_parcel:
+                jobs_ran += 1
+                continue
+
+            # 2. Claim and run next queued ML county job
+            ran_ml = process_next_queued_job(
+                supabase=sb,
+                pipeline="ml",
+                executor=args.executor,
+                worker_id=worker_id,
+                nas_root=nas_root,
+                env_file=env_file,
+                omp_threads=omp_threads,
+                tile_loader_workers=tile_loader_workers,
+            )
+            if ran_ml:
+                jobs_ran += 1
+                continue
+
+            break
+        return jobs_ran
+
+    while True:
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = [pool.submit(worker_loop, idx + 1) for idx in range(max_workers)]
+            for future in as_completed(futures):
+                future.result()
 
         if not args.watch:
-            print("All queued run_parcel and run_ml jobs in county_lookup are complete.")
+            print("All queued run_parcel and run_ml jobs in county_lookup are complete.", flush=True)
             break
 
         time.sleep(30)
