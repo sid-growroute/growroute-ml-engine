@@ -41,16 +41,16 @@ flowchart TD
 
 4. **Computer Vision & Geospatial Feature Extraction (`src/detectors/pool_canopy.py`):**
    - **RGB-to-BGR Conversion:** Reads bands `(1, 2, 3)` via `rasterio`, converts `RGB -> BGR` for Ultralytics `YOLO(..., task="segment")`, and extracts band `4` (`NIR`) when present.
-   - **Pool & Spa Segmentation:** Runs `YOLO11s-seg` (`classes: {0: 'pool', 1: 'spa'}`). Associates any detected `spa` within `20m` of a pool centroid (`has_spa = true`) and estimates `pool_sqft` from the ground sample distance (`meters_per_px`).
+   - **Pool & Spa Segmentation:** Runs `YOLO11s-seg` (`classes: {0: 'pool', 1: 'spa'}`). Associates any detected `spa` within `20m` of a pool centroid (`ai_has_spa = true`) and estimates `ai_pool_sqft` from the ground sample distance (`meters_per_px`).
    - **CRS Reprojection (`EPSG:26914` -> `EPSG:4326`):** Converts pixel centroids `(cx, cy)` via the GeoTIFF affine transform (`rasterio.transform.xy`) and reprojects from native UTM meters (`EPSG:26914`) to WGS84 (`lng`, `lat`) via `rasterio.warp.transform`.
-   - **15m Tree Canopy Ring:** Masks a `15m` buffer ring around each pool bounding box and computes `ai_tree_canopy_pct` (`0–100%`) using 4-band `NDVI = (NIR - Red) / (NIR + Red)` + shade threshold (or RGB Excess Green + HSV fallback). Sets `tree_overhang = true` in PostGIS when `>= 35%`.
-   - **Pool Water Clarity:** Evaluates inner-crop HSV hue/saturation to classify `cv_pool_condition` as `"clean"` or `"green"` (algae).
+   - **15m Tree Canopy Ring:** Masks a `15m` buffer ring around each pool bounding box and computes `ai_tree_canopy_pct` (`0–100%`) using 4-band `NDVI = (NIR - Red) / (NIR + Red)` + shade threshold (or RGB Excess Green + HSV fallback). Sets `ai_tree_overhang = true` in PostGIS when `>= 35%`.
+   - **Pool Water Clarity:** Evaluates inner-crop HSV hue/saturation to classify `ai_pool_condition` as `"clean"` or `"green"` (algae).
    - **Hard-Negative Mining (`src/utils/hard_negatives.py`):** Any borderline detections in `[0.25, 0.44]` confidence are exported as 95%-quality `.jpg` tiles + YOLO `.txt` pre-labels in `./runs/hard_negatives/` for rapid Roboflow relabeling.
 
 5. **PostGIS Spatial Join & Rollup (`ingest_ml_detections` & `refresh_market_intelligence_metrics`):**
    - Stamps all parcels in `p_scanned_h3_cells` with `ai_last_verified_at = now()`.
    - Spatially joins each detection point (`ST_SetSRID(ST_MakePoint(lng, lat), 4326)`) against `public.parcels.geom` using the GIST spatial index (`ST_Contains` prioritized, with a `~20m` `ST_DWithin` tolerance for slight aerial orthorectification offsets).
-   - Updates `ai_has_pool`, `cv_has_pool`, `ai_pool_confidence`, `ai_tree_canopy_pct`, `tree_overhang`, `pool_sqft`, `cv_pool_condition`, `cad_has_spa`, and `pool_detection_source` (`'both'` or `'ai'`), then refreshes county-level totals in `public.county_lookup`.
+   - Updates `ai_has_pool`, `ai_pool_confidence`, `ai_tree_canopy_pct`, `ai_tree_overhang`, `ai_pool_sqft`, `ai_pool_condition`, `ai_has_spa`, and `pool_detection_source` (`'both'` or `'ai'`), then refreshes county-level totals in `public.county_lookup`.
 
 ---
 

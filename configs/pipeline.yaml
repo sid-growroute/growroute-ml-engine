@@ -20,7 +20,7 @@ classes:
 
 canopy:
   buffer_meters: 15.0                # 15m leaf-drop ring around detected pool
-  overhang_threshold_pct: 35.0       # Sets tree_overhang = true when >= 35%
+  overhang_threshold_pct: 35.0       # Sets ai_tree_overhang = true when >= 35%
 
 s3:
   bucket: "growroute-naip-tiles"

@@ -47,6 +47,7 @@ class S3TileLoader:
             region_name=os.getenv("AWS_REGION", "us-east-1"),
         )
         self._lock = threading.Lock()
+        self._gdal_lock = threading.Lock()
         self._sas_token: Optional[str] = None
         self._sas_expiry: float = 0.0
 
@@ -70,16 +71,16 @@ class S3TileLoader:
             return path
         return None
 
-    def _get_naip_sas_token(self) -> str:
+    def _get_naip_sas_token(self, force_refresh: bool = False) -> str:
         now = time.time()
         with self._lock:
-            if self._sas_token and now < self._sas_expiry:
+            if not force_refresh and self._sas_token and now < self._sas_expiry:
                 return self._sas_token
             resp = requests.get(self.STAC_TOKEN_URL, timeout=10)
             resp.raise_for_status()
             data = resp.json()
             self._sas_token = data["token"]
-            self._sas_expiry = now + 1800  # Refresh every 30 minutes
+            self._sas_expiry = now + 1500  # Refresh every 25 minutes
             return self._sas_token
 
     def _pull_from_public_naip_to_nas(self, h3_index: str, local_path: Path) -> Optional[Path]:
@@ -112,34 +113,46 @@ class S3TileLoader:
                     return None
 
                 href = features[0]["assets"]["image"]["href"]
-                token = self._get_naip_sas_token()
+                token = self._get_naip_sas_token(force_refresh=(attempt > 0))
                 signed_url = f"{href}?{token}"
 
-                # Stream only the H3 window from the remote COG and write it to the Synology NAS
-                with rasterio.open(signed_url) as src:
-                    left, bottom, right, top = transform_bounds(
-                        "EPSG:4326", src.crs, *bbox_wgs84, densify_pts=21
-                    )
-                    window = from_bounds(left, bottom, right, top, transform=src.transform)
-                    window = window.round_offsets().round_lengths()
+                # Stream only the H3 window from the remote COG and write it to the Synology NAS.
+                # Serialize GDAL /vsicurl/ reads per process and disable sidecar probing to prevent
+                # Azure Blob 403s and libgdal multi-thread curl state corruption.
+                with self._gdal_lock:
+                    with rasterio.Env(
+                        GDAL_DISABLE_READDIR_ON_OPEN="EMPTY_DIR",
+                        CPL_VSIL_CURL_USE_HEAD="NO",
+                        GDAL_HTTP_MAX_RETRY="3",
+                        GDAL_HTTP_RETRY_DELAY="1",
+                        GDAL_HTTP_TIMEOUT="20",
+                        GDAL_CACHEMAX=64,
+                        VSI_CACHE=False,
+                    ):
+                        with rasterio.open(signed_url) as src:
+                            left, bottom, right, top = transform_bounds(
+                                "EPSG:4326", src.crs, *bbox_wgs84, densify_pts=21
+                            )
+                            window = from_bounds(left, bottom, right, top, transform=src.transform)
+                            window = window.round_offsets().round_lengths()
 
-                    data = src.read(window=window, boundless=True, fill_value=0)
-                    win_transform = src.window_transform(window)
+                            data = src.read(window=window, boundless=True, fill_value=0)
+                            win_transform = src.window_transform(window)
 
-                    profile = src.profile.copy()
-                    profile.update(
-                        driver="GTiff",
-                        height=int(window.height),
-                        width=int(window.width),
-                        count=src.count,
-                        transform=win_transform,
-                        compress="deflate",
-                        tiled=False,
-                    )
+                            profile = src.profile.copy()
+                            profile.update(
+                                driver="GTiff",
+                                height=int(window.height),
+                                width=int(window.width),
+                                count=src.count,
+                                transform=win_transform,
+                                compress="deflate",
+                                tiled=False,
+                            )
 
-                    local_path.parent.mkdir(parents=True, exist_ok=True)
-                    with rasterio.open(local_path, "w", **profile) as dst:
-                        dst.write(data)
+                local_path.parent.mkdir(parents=True, exist_ok=True)
+                with rasterio.open(local_path, "w", **profile) as dst:
+                    dst.write(data)
 
                 if local_path.exists() and local_path.stat().st_size > 0:
                     with self._lock:

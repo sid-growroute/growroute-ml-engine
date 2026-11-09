@@ -12,12 +12,51 @@ from dotenv import load_dotenv
 from supabase import create_client
 
 _PRINT_LOCK = threading.Lock()
+_DOCKER_LOCK = threading.Lock()
 
 
 def log_prefixed(county_name: str, county_fips: str, message: str) -> None:
     prefix = f"[{county_name.upper()} | {county_fips}]"
     with _PRINT_LOCK:
         print(f"{prefix} {message}", flush=True)
+
+
+def ensure_docker_daemon_ready(timeout_sec: int = 90) -> None:
+    """Ensures Docker Desktop daemon is responsive before starting a container."""
+    res = subprocess.run(
+        ["docker", "info"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    if res.returncode == 0:
+        return
+
+    with _DOCKER_LOCK:
+        res = subprocess.run(
+            ["docker", "info"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if res.returncode == 0:
+            return
+
+        print("[Orchestrator] Docker daemon not responding; launching Docker Desktop and waiting...", flush=True)
+        subprocess.run(["open", "-a", "Docker"], check=False)
+        deadline = time.time() + timeout_sec
+        while time.time() < deadline:
+            time.sleep(3)
+            chk = subprocess.run(
+                ["docker", "info"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            if chk.returncode == 0:
+                print("[Orchestrator] Docker daemon is ready.", flush=True)
+                return
+        raise RuntimeError("Docker daemon failed to become ready within timeout.")
 
 
 def verify_nas_root(nas_root: Path) -> None:
@@ -42,6 +81,7 @@ def _stream_docker_container(
     county_fips: str,
 ) -> None:
     """Runs a docker command and streams stdout/stderr line-by-line with county prefix."""
+    ensure_docker_daemon_ready()
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,

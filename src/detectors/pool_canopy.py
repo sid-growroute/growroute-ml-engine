@@ -220,7 +220,7 @@ class PoolSpaCanopyDetector:
 
             lng, lat = geo_ctx.pixel_to_lnglat(cx, cy)
             area_px = max((x2 - x1) * (y2 - y1) * 0.78, 1.0)
-            pool_sqft = int(round(area_px * sqft_per_px2))
+            ai_pool_sqft = int(round(area_px * sqft_per_px2))
             canopy_pct = estimate_canopy_pct_around_pool(
                 img_bgr, nir_band, (x1, y1, x2, y2), m_per_px, buffer_meters
             )
@@ -231,10 +231,11 @@ class PoolSpaCanopyDetector:
                 "lat": round(lat, 7),
                 "lng": round(lng, 7),
                 "ai_pool_confidence": conf,
+                "ai_pool_condition": condition,
+                "ai_pool_sqft": max(min(ai_pool_sqft, 2500), 150),
+                "ai_has_spa": False,
                 "ai_tree_canopy_pct": canopy_pct,
-                "pool_sqft": max(min(pool_sqft, 2500), 150),
-                "cv_pool_condition": condition,
-                "has_spa": False,
+                "ai_tree_overhang": bool(canopy_pct >= 35.0),
                 "_center_px": (cx, cy),
             })
 
@@ -243,7 +244,7 @@ class PoolSpaCanopyDetector:
             px, py = p.pop("_center_px")
             for sx, sy in spa_centers:
                 if np.hypot(px - sx, py - sy) <= max_spa_dist_px:
-                    p["has_spa"] = True
+                    p["ai_has_spa"] = True
                     break
 
         return pools, hard_neg_boxes, img_bgr
