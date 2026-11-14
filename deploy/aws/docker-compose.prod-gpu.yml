@@ -1,0 +1,31 @@
+services:
+  ml-worker:
+    image: ${ML_WORKER_GPU_IMAGE:-growroute-ml:prod-gpu}
+    build:
+      context: ../..
+      dockerfile: Dockerfile.gpu
+    restart: unless-stopped
+    env_file:
+      - path: ../../.env
+        required: false
+    environment:
+      AWS_REGION: ${AWS_REGION:-us-west-2}
+      AWS_REQUEST_PAYER: ${AWS_REQUEST_PAYER:-requester}
+      S3_DATA_BUCKET: ${S3_DATA_BUCKET}
+      S3_TILE_BUCKET: ${S3_TILE_BUCKET:-growroute-naip-tiles}
+      ML_SQS_URL: ${ML_SQS_URL}
+      ML_SHARD_SIZE: ${ML_SHARD_SIZE:-150}
+      ML_DEVICE: "0"
+      OMP_NUM_THREADS: "4"
+      MKL_NUM_THREADS: "4"
+      TORCH_NUM_THREADS: "4"
+      TILE_LOADER_WORKERS: ${TILE_LOADER_WORKERS:-8}
+      SUPABASE_URL: ${SUPABASE_URL}
+      SUPABASE_SERVICE_ROLE_KEY: ${SUPABASE_SERVICE_ROLE_KEY}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

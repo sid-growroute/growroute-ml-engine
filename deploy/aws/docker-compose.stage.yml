@@ -1,0 +1,42 @@
+services:
+  parcel-worker:
+    image: ${PARCEL_WORKER_IMAGE:-growroute-parcel:stage}
+    build:
+      context: ../../../growroute-parcel-engine
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file:
+      - path: ../../.env
+        required: false
+    environment:
+      AWS_REGION: ${AWS_REGION:-us-west-2}
+      S3_DATA_BUCKET: ${S3_DATA_BUCKET}
+      PARCEL_SQS_URL: ${PARCEL_SQS_URL}
+      PARCEL_LIMIT: ${PARCEL_LIMIT:-0}
+      SUPABASE_DB_URL: ${SUPABASE_DB_URL}
+      SUPABASE_URL: ${SUPABASE_URL}
+      SUPABASE_SERVICE_ROLE_KEY: ${SUPABASE_SERVICE_ROLE_KEY}
+
+  ml-worker:
+    image: ${ML_WORKER_CPU_IMAGE:-growroute-ml:stage-cpu}
+    build:
+      context: ../..
+      dockerfile: Dockerfile.cpu
+    restart: unless-stopped
+    env_file:
+      - path: ../../.env
+        required: false
+    environment:
+      AWS_REGION: ${AWS_REGION:-us-west-2}
+      AWS_REQUEST_PAYER: ${AWS_REQUEST_PAYER:-requester}
+      S3_DATA_BUCKET: ${S3_DATA_BUCKET}
+      S3_TILE_BUCKET: ${S3_TILE_BUCKET:-growroute-naip-tiles}
+      ML_SQS_URL: ${ML_SQS_URL}
+      ML_SHARD_SIZE: ${ML_SHARD_SIZE:-150}
+      ML_DEVICE: cpu
+      OMP_NUM_THREADS: "2"
+      MKL_NUM_THREADS: "2"
+      TORCH_NUM_THREADS: "2"
+      TILE_LOADER_WORKERS: ${TILE_LOADER_WORKERS:-4}
+      SUPABASE_URL: ${SUPABASE_URL}
+      SUPABASE_SERVICE_ROLE_KEY: ${SUPABASE_SERVICE_ROLE_KEY}

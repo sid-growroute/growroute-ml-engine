@@ -2,8 +2,8 @@
 .git/
 __pycache__/
 *.pyc
+.DS_Store
 .env
 data/
 tiles_cache/
 runs/
-models/*.pt
