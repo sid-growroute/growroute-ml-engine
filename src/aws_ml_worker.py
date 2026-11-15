@@ -562,6 +562,7 @@ def handle_run_shard(
         )
 
         # 2. Spatially join detections and stamp scanned H3 cells in public.parcels
+        model_version = os.getenv("AI_MODEL_VERSION", "yolov11_pool_dfw_v1").strip() or "yolov11_pool_dfw_v1"
         matched_parcels = 0
         if scanned_h3:
             ingest_res = supabase.rpc(
@@ -570,6 +571,7 @@ def handle_run_shard(
                     "p_scanned_h3_cells": scanned_h3,
                     "p_detections": detections,
                     "p_run_id": run_id,
+                    "p_model_version": model_version,
                 },
             ).execute()
             if isinstance(ingest_res.data, int):
