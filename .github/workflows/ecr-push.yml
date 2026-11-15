@@ -1,4 +1,4 @@
-name: Build & Push ML Engine to ECR
+name: Build, Push & Deploy ML Engine
 
 on:
   push:
@@ -31,9 +31,10 @@ env:
   AWS_REGION: us-west-2
   AWS_ROLE_ARN: arn:aws:iam::226259226741:role/growroute-github-ecr-push-role
   ECR_REPOSITORY: growroute-ml-engine
+  STAGE_INSTANCE_ID: i-06e0d9784875b9c3c
 
 jobs:
-  build-and-push:
+  build-and-deploy:
     runs-on: ubuntu-latest
     steps:
       - name: Free runner disk space for CUDA GPU builds
@@ -65,6 +66,7 @@ jobs:
           REGISTRY="${{ steps.login-ecr.outputs.registry }}"
           TARGET="${{ github.event.inputs.target || 'stage-cpu' }}"
           SHORT_SHA="${GITHUB_SHA::7}"
+          echo "target=${TARGET}" >> "$GITHUB_OUTPUT"
 
           if [ "$TARGET" = "prod-gpu" ]; then
             echo "dockerfile=./Dockerfile.gpu" >> "$GITHUB_OUTPUT"
@@ -89,3 +91,69 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           cache-from: type=gha,scope=${{ steps.meta.outputs.scope }}
           cache-to: type=gha,mode=max,scope=${{ steps.meta.outputs.scope }}
+
+      - name: Roll ml-worker on Stage EC2 via SSM
+        if: ${{ steps.meta.outputs.target == 'stage-cpu' }}
+        run: |
+          STATE=$(aws ec2 describe-instances \
+            --instance-ids "$STAGE_INSTANCE_ID" \
+            --query "Reservations[0].Instances[0].State.Name" \
+            --output text)
+
+          if [ "$STATE" != "running" ]; then
+            echo "Stage EC2 ($STAGE_INSTANCE_ID) state is '$STATE'. Skipping live SSM deploy; growroute-stage-sync.service will pull :stage-cpu on next wake."
+            exit 0
+          fi
+
+          PING=$(aws ssm describe-instance-information \
+            --filters "Key=InstanceIds,Values=${STAGE_INSTANCE_ID}" \
+            --query "InstanceInformationList[0].PingStatus" \
+            --output text)
+
+          if [ "$PING" != "Online" ]; then
+            echo "::warning::Stage EC2 is running but SSM PingStatus is '$PING'. Skipping live rollout."
+            exit 0
+          fi
+
+          PARAMS=$(jq -n '{
+            commands: [
+              "set -euo pipefail",
+              "sudo -iu ubuntu bash -lc '\''aws ecr get-login-password --region us-west-2 | docker login --username AWS --password-stdin 226259226741.dkr.ecr.us-west-2.amazonaws.com'\''",
+              "sudo -iu ubuntu bash -lc '\''docker compose --env-file /opt/growroute/.env -f /opt/growroute/docker-compose.stage.yml pull ml-worker'\''",
+              "sudo -iu ubuntu bash -lc '\''if [ -f /opt/growroute/growroute-ml-engine/deploy/aws/docker-compose.stage.yml ]; then docker compose --env-file /opt/growroute/.env -f /opt/growroute/growroute-ml-engine/deploy/aws/docker-compose.stage.yml rm -sf ml-worker || true; fi'\''",
+              "sudo -iu ubuntu bash -lc '\''ACTIVE=$(docker compose --env-file /opt/growroute/.env -f /opt/growroute/docker-compose.stage.yml ps -q ml-worker | wc -l | tr -d \" \"); if [ \"${ACTIVE:-0}\" -lt 1 ]; then ACTIVE=4; fi; echo \"Rolling ml-worker at scale=${ACTIVE}\"; docker compose --env-file /opt/growroute/.env -f /opt/growroute/docker-compose.stage.yml up -d --no-deps --scale ml-worker=\"$ACTIVE\" ml-worker && docker image prune -f'\''"
+            ]
+          }')
+
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "$STAGE_INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Deploy growroute-ml-engine:stage-cpu (${GITHUB_SHA::7})" \
+            --parameters "$PARAMS" \
+            --query "Command.CommandId" \
+            --output text)
+
+          echo "Dispatched SSM Command: $CMD_ID"
+          for i in $(seq 1 60); do
+            sleep 5
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$CMD_ID" \
+              --instance-id "$STAGE_INSTANCE_ID" \
+              --query "Status" \
+              --output text 2>/dev/null || echo "Pending")
+            echo "  [$i/60] SSM Status: $STATUS"
+            if [[ "$STATUS" == "Success" || "$STATUS" == "Failed" || "$STATUS" == "Cancelled" || "$STATUS" == "TimedOut" ]]; then
+              break
+            fi
+          done
+
+          aws ssm get-command-invocation \
+            --command-id "$CMD_ID" \
+            --instance-id "$STAGE_INSTANCE_ID" \
+            --query "[StandardOutputContent, StandardErrorContent]" \
+            --output text
+
+          if [ "$STATUS" != "Success" ]; then
+            echo "::error::SSM deployment failed with status: $STATUS"
+            exit 1
+          fi
