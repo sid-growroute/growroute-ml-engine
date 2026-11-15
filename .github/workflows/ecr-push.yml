@@ -1,4 +1,98 @@
-- name: Roll ml-worker on Stage EC2 via SSM
+name: Build, Push & Deploy ML Engine
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "training/**"
+      - "migrations/**"
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Compute variant to build & publish"
+        required: true
+        default: "stage-cpu"
+        type: choice
+        options:
+          - stage-cpu
+          - prod-gpu
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: ecr-ml-${{ github.event.inputs.target || 'stage-cpu' }}
+  cancel-in-progress: true
+
+env:
+  AWS_REGION: us-west-2
+  AWS_ROLE_ARN: arn:aws:iam::226259226741:role/growroute-github-ecr-push-role
+  ECR_REPOSITORY: growroute-ml-engine
+  STAGE_INSTANCE_ID: i-06e0d9784875b9c3c
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Free runner disk space for CUDA GPU builds
+        if: ${{ github.event.inputs.target == 'prod-gpu' }}
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          df -h
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Ensure models directory exists for Docker context
+        run: mkdir -p models
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Resolve Dockerfile and tags
+        id: meta
+        run: |
+          REGISTRY="${{ steps.login-ecr.outputs.registry }}"
+          TARGET="${{ github.event.inputs.target || 'stage-cpu' }}"
+          SHORT_SHA="${GITHUB_SHA::7}"
+          echo "target=${TARGET}" >> "$GITHUB_OUTPUT"
+
+          if [ "$TARGET" = "prod-gpu" ]; then
+            echo "dockerfile=./Dockerfile.gpu" >> "$GITHUB_OUTPUT"
+            echo "scope=ml-gpu" >> "$GITHUB_OUTPUT"
+            echo "tags=${REGISTRY}/${ECR_REPOSITORY}:prod,${REGISTRY}/${ECR_REPOSITORY}:prod-gpu,${REGISTRY}/${ECR_REPOSITORY}:gpu-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          else
+            echo "dockerfile=./Dockerfile.cpu" >> "$GITHUB_OUTPUT"
+            echo "scope=ml-cpu" >> "$GITHUB_OUTPUT"
+            echo "tags=${REGISTRY}/${ECR_REPOSITORY}:stage,${REGISTRY}/${ECR_REPOSITORY}:stage-cpu,${REGISTRY}/${ECR_REPOSITORY}:cpu-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push amd64 image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ steps.meta.outputs.dockerfile }}
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha,scope=${{ steps.meta.outputs.scope }}
+          cache-to: type=gha,mode=max,scope=${{ steps.meta.outputs.scope }}
+
+      - name: Roll ml-worker on Stage EC2 via SSM
         if: ${{ steps.meta.outputs.target == 'stage-cpu' }}
         run: |
           STATE=$(aws ec2 describe-instances \
@@ -21,31 +115,21 @@
             exit 0
           fi
 
-          cat << 'SSM_EOF' | jq -Rsc '{commands: (rtrimstr("\n") | split("\n"))}' > /tmp/ssm-params.json
-          set -eu
-          sudo -u ubuntu -H bash << 'EOS'
-          set -euo pipefail
-          export PATH="/usr/local/bin:/usr/bin:/bin:$PATH"
-          aws ecr get-login-password --region us-west-2 | docker login --username AWS --password-stdin 226259226741.dkr.ecr.us-west-2.amazonaws.com
-          docker compose --env-file /opt/growroute/.env -f /opt/growroute/docker-compose.stage.yml pull ml-worker
-          if [ -f /opt/growroute/growroute-ml-engine/deploy/aws/docker-compose.stage.yml ]; then
-            docker compose --env-file /opt/growroute/.env -f /opt/growroute/growroute-ml-engine/deploy/aws/docker-compose.stage.yml rm -sf ml-worker || true
-          fi
-          ACTIVE=$(docker compose --env-file /opt/growroute/.env -f /opt/growroute/docker-compose.stage.yml ps -q ml-worker | wc -l | tr -d ' ')
-          if [ "${ACTIVE:-0}" -lt 1 ]; then
-            ACTIVE=4
-          fi
-          echo "Rolling ml-worker at scale=${ACTIVE}"
-          docker compose --env-file /opt/growroute/.env -f /opt/growroute/docker-compose.stage.yml up -d --no-deps --scale ml-worker="$ACTIVE" ml-worker
-          docker image prune -f
-          EOS
-          SSM_EOF
+          PARAMS=$(jq -n '{
+            commands: [
+              "set -eu",
+              "sudo -iu ubuntu bash -lc '\''aws ecr get-login-password --region us-west-2 | docker login --username AWS --password-stdin 226259226741.dkr.ecr.us-west-2.amazonaws.com'\''",
+              "sudo -iu ubuntu bash -lc '\''docker compose --env-file /opt/growroute/.env -f /opt/growroute/docker-compose.stage.yml pull ml-worker'\''",
+              "sudo -iu ubuntu bash -lc '\''if [ -f /opt/growroute/growroute-ml-engine/deploy/aws/docker-compose.stage.yml ]; then docker compose --env-file /opt/growroute/.env -f /opt/growroute/growroute-ml-engine/deploy/aws/docker-compose.stage.yml rm -sf ml-worker || true; fi'\''",
+              "sudo -iu ubuntu bash -lc '\''ACTIVE=$(docker compose --env-file /opt/growroute/.env -f /opt/growroute/docker-compose.stage.yml ps -q ml-worker | wc -l | tr -d \" \"); if [ \"${ACTIVE:-0}\" -lt 1 ]; then ACTIVE=4; fi; echo \"Rolling ml-worker at scale=${ACTIVE}\"; docker compose --env-file /opt/growroute/.env -f /opt/growroute/docker-compose.stage.yml up -d --no-deps --scale ml-worker=\"$ACTIVE\" ml-worker && docker image prune -f'\''"
+            ]
+          }')
 
           CMD_ID=$(aws ssm send-command \
             --instance-ids "$STAGE_INSTANCE_ID" \
             --document-name "AWS-RunShellScript" \
             --comment "Deploy growroute-ml-engine:stage-cpu (${GITHUB_SHA::7})" \
-            --parameters file:///tmp/ssm-params.json \
+            --parameters "$PARAMS" \
             --query "Command.CommandId" \
             --output text)
 
@@ -58,7 +142,7 @@
               --query "Status" \
               --output text 2>/dev/null || echo "Pending")
             echo "  [$i/60] SSM Status: $STATUS"
-            if [ "$STATUS" = "Success" ] || [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ] || [ "$STATUS" = "TimedOut" ]; then
+            if [[ "$STATUS" == "Success" || "$STATUS" == "Failed" || "$STATUS" == "Cancelled" || "$STATUS" == "TimedOut" ]]; then
               break
             fi
           done
