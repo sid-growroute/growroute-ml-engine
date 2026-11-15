@@ -3,9 +3,9 @@ model:
   weights_pt: "models/pool_spa_dfw_v2.pt"
   weights_onnx: "models/pool_spa_dfw_v2.onnx"
   imgsz: 640
-  conf_threshold: 0.45
+  conf_threshold: 0.55
   iou_threshold: 0.50
-  hard_negative_range: [0.25, 0.44]  # Auto-saved for Texas v2 retraining
+  hard_negative_range: [0.25, 0.54]  # Auto-saved for Texas v2 retraining
 
 storage:
   s3_bucket: "growroute-naip-tiles"

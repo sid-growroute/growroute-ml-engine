@@ -11,7 +11,7 @@ def main():
     parser.add_argument("--limit", type=int, default=10, help="Number of tiles to test")
     args = parser.parse_args()
 
-    detector = PoolSpaCanopyDetector(weights_path=args.model, device="cpu", conf_threshold=0.45)
+    detector = PoolSpaCanopyDetector(weights_path=args.model, device="cpu", conf_threshold=0.55)
 
     tiles_dir = Path(args.tiles_dir).resolve()
     tiles = sorted(

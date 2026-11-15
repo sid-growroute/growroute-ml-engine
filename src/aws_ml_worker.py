@@ -269,6 +269,23 @@ def enqueue_sqs_shards(
             time.sleep(1.0 * (attempt + 1))
 
 
+COOPERATIVE_SKIP_STATUSES = ("paused", "cancelled")
+
+
+def get_county_ml_status(supabase: Client, state_code: str, county_fips: str) -> str:
+    res = (
+        supabase.table("county_lookup")
+        .select("ml_status")
+        .eq("state_code", state_code)
+        .eq("county_fips", county_fips)
+        .maybe_single()
+        .execute()
+    )
+    if res and res.data:
+        return str(res.data.get("ml_status") or "").strip().lower()
+    return ""
+
+
 def handle_plan_county(
     payload: Dict[str, Any],
     supabase: Client,
@@ -284,31 +301,30 @@ def handle_plan_county(
     county_name = str(payload.get("county_name") or "").strip()
     ml_max_tiles = payload.get("ml_max_tiles")
 
-    if not county_fips or not county_name:
-        lookup = (
-            supabase.table("county_lookup")
-            .select("state_code, county_fips, county_name, ml_max_tiles")
-            .eq("county_fips", county_fips)
-            .maybe_single()
-            .execute()
-        )
-        if lookup.data:
-            state_code = lookup.data.get("state_code") or state_code
-            county_name = lookup.data.get("county_name") or county_name
-            if ml_max_tiles is None:
-                ml_max_tiles = lookup.data.get("ml_max_tiles")
+    query = supabase.table("county_lookup").select(
+        "state_code, county_fips, county_name, ml_status, ml_max_tiles"
+    ).eq("state_code", state_code)
+    if county_fips:
+        query = query.eq("county_fips", county_fips)
+    elif county_name:
+        query = query.ilike("county_name", county_name)
 
-    if ml_max_tiles is None:
-        lookup_tiles = (
-            supabase.table("county_lookup")
-            .select("ml_max_tiles")
-            .eq("state_code", state_code)
-            .eq("county_fips", county_fips)
-            .maybe_single()
-            .execute()
+    lookup = query.maybe_single().execute()
+    current_status = ""
+    if lookup and lookup.data:
+        state_code = str(lookup.data.get("state_code") or state_code).strip().upper()
+        county_fips = str(lookup.data.get("county_fips") or county_fips).strip()
+        county_name = str(lookup.data.get("county_name") or county_name).strip()
+        current_status = str(lookup.data.get("ml_status") or "").strip().lower()
+        if ml_max_tiles is None:
+            ml_max_tiles = lookup.data.get("ml_max_tiles")
+
+    if current_status in COOPERATIVE_SKIP_STATUSES:
+        print(
+            f"[{county_name or county_fips}] ml_status={current_status}; dropping SQS message cleanly without scanning",
+            flush=True,
         )
-        if lookup_tiles.data:
-            ml_max_tiles = lookup_tiles.data.get("ml_max_tiles")
+        return
 
     max_tiles_int = int(ml_max_tiles) if ml_max_tiles is not None else 0
     county_slug = slugify_county(county_name)
@@ -318,18 +334,32 @@ def handle_plan_county(
         total_cells = len(h3_cells)
 
         if total_cells == 0:
+            upd_done = (
+                supabase.table("county_lookup")
+                .update({
+                    "ml_status": "completed",
+                    "last_ml_run_at": datetime.now(timezone.utc).isoformat(),
+                    "active_worker_id": None,
+                    "last_pipeline_error": None,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                })
+                .eq("state_code", state_code)
+                .eq("county_fips", county_fips)
+                .not_.in_("ml_status", list(COOPERATIVE_SKIP_STATUSES))
+                .execute()
+            )
+            if not upd_done.data:
+                latest = get_county_ml_status(supabase, state_code, county_fips)
+                print(
+                    f"[{county_name}] ml_status={latest}; dropping SQS message cleanly without scanning",
+                    flush=True,
+                )
+                return
+
             print(
                 f"[ML Planner] 0 unscanned H3 cells remaining for {county_name} ({state_code}-{county_fips}); marking completed.",
                 flush=True,
             )
-            supabase.table("county_lookup").update({
-                "ml_status": "completed",
-                "last_ml_run_at": datetime.now(timezone.utc).isoformat(),
-                "active_worker_id": None,
-                "last_pipeline_error": None,
-                "updated_at": datetime.now(timezone.utc).isoformat(),
-            }).eq("state_code", state_code).eq("county_fips", county_fips).execute()
-
             supabase.rpc(
                 "refresh_market_intelligence_metrics",
                 {"p_state_code": state_code, "p_county_fips": county_fips},
@@ -342,6 +372,30 @@ def handle_plan_county(
         )
         shards = chunk_list(h3_cells, max(1, shard_size))
         total_shards = len(shards)
+
+        upd_running = (
+            supabase.table("county_lookup")
+            .update({
+                "ml_status": "running",
+                "total_h3_cells": total_cells,
+                "scanned_h3_cells": 0,
+                "active_worker_id": worker_id,
+                "last_pipeline_error": None,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            })
+            .eq("state_code", state_code)
+            .eq("county_fips", county_fips)
+            .not_.in_("ml_status", list(COOPERATIVE_SKIP_STATUSES))
+            .execute()
+        )
+        if not upd_running.data:
+            latest = get_county_ml_status(supabase, state_code, county_fips)
+            if latest in COOPERATIVE_SKIP_STATUSES:
+                print(
+                    f"[{county_name}] ml_status={latest}; dropping SQS message cleanly without scanning",
+                    flush=True,
+                )
+                return
 
         manifest = {
             "run_id": run_id,
@@ -368,15 +422,6 @@ def handle_plan_county(
             ContentType="application/json",
         )
 
-        supabase.table("county_lookup").update({
-            "ml_status": "running",
-            "total_h3_cells": total_cells,
-            "scanned_h3_cells": 0,
-            "active_worker_id": worker_id,
-            "last_pipeline_error": None,
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-        }).eq("state_code", state_code).eq("county_fips", county_fips).execute()
-
         shard_messages = [
             {
                 "mode": "run_shard",
@@ -398,12 +443,19 @@ def handle_plan_county(
         )
 
     except Exception as exc:
-        supabase.table("county_lookup").update({
-            "ml_status": "failed",
-            "active_worker_id": None,
-            "last_pipeline_error": str(exc)[:1500],
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-        }).eq("state_code", state_code).eq("county_fips", county_fips).execute()
+        (
+            supabase.table("county_lookup")
+            .update({
+                "ml_status": "failed",
+                "active_worker_id": None,
+                "last_pipeline_error": str(exc)[:1500],
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            })
+            .eq("state_code", state_code)
+            .eq("county_fips", county_fips)
+            .not_.in_("ml_status", list(COOPERATIVE_SKIP_STATUSES))
+            .execute()
+        )
         raise
 
 
@@ -468,6 +520,14 @@ def handle_run_shard(
     if not h3_cells:
         return
 
+    current_status = get_county_ml_status(supabase, state_code, county_fips)
+    if current_status in COOPERATIVE_SKIP_STATUSES:
+        print(
+            f"[{county_name}] ml_status={current_status}; dropping SQS message cleanly without scanning",
+            flush=True,
+        )
+        return
+
     tile_map: Dict[str, Path] = {}
     try:
         tile_map = s3_loader.fetch_batch(h3_cells, county=county_name)
@@ -528,6 +588,10 @@ def handle_run_shard(
         scanned_now = int(progress_data.get("scanned_h3_cells", 0))
         total_planned = int(progress_data.get("total_h3_cells", 0))
         completed_now = bool(progress_data.get("completed_now", False))
+        latest_status = (
+            str(progress_data.get("ml_status") or "").strip().lower()
+            or get_county_ml_status(supabase, state_code, county_fips)
+        )
 
         print(
             f"[ML Shard {shard_index + 1}/{total_shards}] {county_name}: "
@@ -536,15 +600,31 @@ def handle_run_shard(
             flush=True,
         )
 
-        if completed_now or (total_planned > 0 and scanned_now >= total_planned):
-            supabase.table("county_lookup").update({
-                "ml_status": "completed",
-                "last_ml_run_at": datetime.now(timezone.utc).isoformat(),
-                "active_worker_id": None,
-                "updated_at": datetime.now(timezone.utc).isoformat(),
-            }).eq("state_code", state_code).eq("county_fips", county_fips).execute()
+        # In-flight shard race guard: never overwrite 'paused' or 'cancelled' back to 'completed'
+        if latest_status in COOPERATIVE_SKIP_STATUSES:
+            print(
+                f"[ML Shard {shard_index + 1}/{total_shards}] {county_name}: "
+                f"in-flight shard persisted while ml_status={latest_status}; preserving {latest_status} status.",
+                flush=True,
+            )
+            return
 
-            if completed_now:
+        if completed_now or (total_planned > 0 and scanned_now >= total_planned):
+            upd_completed = (
+                supabase.table("county_lookup")
+                .update({
+                    "ml_status": "completed",
+                    "last_ml_run_at": datetime.now(timezone.utc).isoformat(),
+                    "active_worker_id": None,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                })
+                .eq("state_code", state_code)
+                .eq("county_fips", county_fips)
+                .not_.in_("ml_status", list(COOPERATIVE_SKIP_STATUSES))
+                .execute()
+            )
+
+            if completed_now and upd_completed.data:
                 print(
                     f"[ML Worker] Final shard completed for {county_name} ({state_code}-{county_fips}); "
                     "refreshing market_intelligence_metrics...",
@@ -587,8 +667,8 @@ def main() -> None:
     models_dir = Path(os.getenv("ML_MODELS_DIR", "/app/models" if Path("/app").exists() else "./models"))
     cache_dir = os.getenv("ML_EPHEMERAL_CACHE_DIR", "/tmp/tiles_cache")
     imgsz = int(cfg.get("model", {}).get("imgsz", 640))
-    conf_threshold = float(cfg.get("model", {}).get("conf_threshold", 0.45))
-    hard_neg_range = tuple(cfg.get("model", {}).get("hard_negative_range", [0.25, 0.44]))
+    conf_threshold = float(os.getenv("ML_CONF_THRESHOLD") or cfg.get("model", {}).get("conf_threshold", 0.55))
+    hard_neg_range = tuple(cfg.get("model", {}).get("hard_negative_range", [0.25, 0.54]))
     buffer_meters = float(cfg.get("canopy", {}).get("buffer_meters", 15.0))
 
     sqs_client = boto3.client("sqs", region_name=aws_region)
@@ -608,6 +688,7 @@ def main() -> None:
         device=device,
         conf_threshold=conf_threshold,
         hard_neg_range=(float(hard_neg_range[0]), float(hard_neg_range[1])),
+        imgsz=imgsz,
     )
 
     s3_loader = S3TileLoader(
