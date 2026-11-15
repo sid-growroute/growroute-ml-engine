@@ -118,10 +118,10 @@ jobs:
           PARAMS=$(jq -n '{
             commands: [
               "set -eu",
-              "sudo -iu ubuntu bash -lc '\''grep -qs ecr-login ~/.docker/config.json || (aws ecr get-login-password --region us-west-2 | docker login --username AWS --password-stdin 226259226741.dkr.ecr.us-west-2.amazonaws.com)'\''",
-              "sudo -iu ubuntu bash -lc '\''docker compose --env-file /opt/growroute/.env -f /opt/growroute/docker-compose.stage.yml pull ml-worker'\''",
-              "sudo -iu ubuntu bash -lc '\''if [ -f /opt/growroute/growroute-ml-engine/deploy/aws/docker-compose.stage.yml ]; then docker compose --env-file /opt/growroute/.env -f /opt/growroute/growroute-ml-engine/deploy/aws/docker-compose.stage.yml rm -sf ml-worker || true; fi'\''",
-              "sudo -iu ubuntu bash -lc '\''ACTIVE=$(docker compose --env-file /opt/growroute/.env -f /opt/growroute/docker-compose.stage.yml ps -q ml-worker | wc -l | tr -d \" \"); if [ \"${ACTIVE:-0}\" -lt 1 ]; then ACTIVE=4; fi; echo \"Rolling ml-worker at scale=${ACTIVE}\"; docker compose --env-file /opt/growroute/.env -f /opt/growroute/docker-compose.stage.yml up -d --no-deps --scale ml-worker=\"$ACTIVE\" ml-worker && docker image prune -f'\''"
+              "sudo -u ubuntu -H bash -lc '\''grep -qs ecr-login ~/.docker/config.json || (aws ecr get-login-password --region us-west-2 | docker login --username AWS --password-stdin 226259226741.dkr.ecr.us-west-2.amazonaws.com)'\''",
+              "sudo -u ubuntu -H bash -lc '\''docker compose --env-file /opt/growroute/.env -f /opt/growroute/docker-compose.stage.yml pull ml-worker'\''",
+              "sudo -u ubuntu -H bash -lc '\''if [ -f /opt/growroute/growroute-ml-engine/deploy/aws/docker-compose.stage.yml ]; then docker compose --env-file /opt/growroute/.env -f /opt/growroute/growroute-ml-engine/deploy/aws/docker-compose.stage.yml rm -sf ml-worker || true; fi'\''",
+              "sudo -u ubuntu -H bash -lc '\''ACTIVE=$(docker compose --env-file /opt/growroute/.env -f /opt/growroute/docker-compose.stage.yml ps -q ml-worker | wc -l | tr -d \" \"); if [ \"${ACTIVE:-0}\" -lt 1 ]; then ACTIVE=4; fi; echo \"Rolling ml-worker at scale=${ACTIVE}\"; docker compose --env-file /opt/growroute/.env -f /opt/growroute/docker-compose.stage.yml up -d --no-deps --scale ml-worker=\"${ACTIVE}\" ml-worker && docker image prune -f'\''"
             ]
           }')
 
