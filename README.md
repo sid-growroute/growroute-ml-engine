@@ -67,16 +67,20 @@ python3 scripts/verify_above_ground_pools.py --strict
 
 ---
 
-## 4. Deployment, CI Path Filters & Debugging Commands
+## 4. Deployment, CI/CD Promotion & Operations Runbook
 
-### CI/CD (`ecr-push.yml`)
-Pushes to `main` build `:stage-cpu` (`workflow_dispatch` supports `stage-cpu` or `prod-gpu`) and roll `ml-worker` on Stage EC2 via SSM. Commits touching only `README.md`, `**/*.md`, `docs/**`, `scripts/**`, `training/**`, or `migrations/**` are ignored on `push`.
+### CI/CD (`deploy-ecr.yml` — `main` -> Stage, `release` -> Prod)
+- **Push to `main`:** Runs Python syntax gate and publishes `:stage-cpu`, `:stage`, and `:sha-<short>` via keyless AWS OIDC (`growroute-github-ecr-deploy-role`). Commits touching only `README.md`, `**/*.md`, `docs/**`, `scripts/**`, `training/**`, or `migrations/**` are ignored on `push`.
+- **Push / PR merge to `release`:** Gated by GitHub Environment `production`, publishes `:prod-cpu`, `:prod`, and `:release-<YYYYMMDD>-<short_sha>`, and enforces the **Zero-Idle-Cost Deploy Rule** on `i-0f914b78bfe09b165` (never wakes a `stopped` `$0.00/hr` worker; restarts `growroute-workers.service` via SSM only if `running` with `0` active SQS jobs).
+- **Day-to-Day Operations CLI:** Full Stage & Prod operational tooling (`make smoke-stage`, `make smoke-prod`, `make inspect-prod`, `make status-prod`, `make logs-prod`, `ops/pipeline_ctl.py`) lives in `../growroute-parcel-engine/ops/` — see [`growroute-parcel-engine/README.md`](../growroute-parcel-engine/README.md) for the complete Stage & Prod runbook.
 
-### Handy `ml-worker`, SSM GPU/CPU & DLQ Debugging Commands
+### Handy `ml-worker`, Inspector & DLQ Debugging Commands
 
 ```bash
-# 1. Tail live ml-worker shard logs (from growroute-parcel-engine ops CLI or directly on EC2)
-make -C ../growroute-parcel-engine logs ENV=stage SERVICE=ml-worker TAIL=80
+# 1. Run non-destructive Stage/Prod smoke test & deep ML shard inspector (works while EC2 is stopped)
+make -C ../growroute-parcel-engine smoke-prod
+python3 ../growroute-parcel-engine/ops/inspect_pipelines.py --env prod --pipeline ml --county Dallas
+make -C ../growroute-parcel-engine logs-prod
 
 # 2. Inspect CPU/RAM container stats (Stage) or NVIDIA L4 GPU utilization (Prod) via AWS SSM
 CMD_ID=$(aws ssm send-command \
