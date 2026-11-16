@@ -1,15 +1,7 @@
 name: Build, Push & Deploy ML Engine
 
+# Superseded for push-to-main / release CPU promotion by deploy-ecr.yml; retained for manual GPU dispatch only.
 on:
-  push:
-    branches: [main]
-    paths-ignore:
-      - "README.md"
-      - "**/*.md"
-      - "docs/**"
-      - "scripts/**"
-      - "training/**"
-      - "migrations/**"
   workflow_dispatch:
     inputs:
       target:

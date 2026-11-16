@@ -1,0 +1,269 @@
+name: Build & Deploy ML Engine (Stage & Prod ECR)
+
+on:
+  push:
+    branches:
+      - main
+      - release
+    paths-ignore:
+      - "README.md"
+      - "**/*.md"
+      - "docs/**"
+      - "scripts/**"
+      - "training/**"
+      - "migrations/**"
+  workflow_dispatch:
+    inputs:
+      target_env:
+        description: "Target environment to build & promote"
+        required: true
+        default: "stage"
+        type: choice
+        options:
+          - stage
+          - prod
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: ecr-ml-${{ github.event_name == 'workflow_dispatch' && inputs.target_env || (github.ref_name == 'release' && 'prod' || 'stage') }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-west-2
+  AWS_ACCOUNT_ID: "226259226741"
+  ECR_REPOSITORY: growroute-ml-engine
+  STAGE_INSTANCE_ID: i-06e0d9784875b9c3c
+  PROD_INSTANCE_ID: i-0f914b78bfe09b165
+
+jobs:
+  validate:
+    name: Syntax & Lint Gate
+    runs-on: ubuntu-latest
+    outputs:
+      resolved_env: ${{ steps.resolve.outputs.resolved_env }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Resolve target environment
+        id: resolve
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "resolved_env=${{ inputs.target_env }}" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.ref_name }}" = "release" ]; then
+            echo "resolved_env=prod" >> "$GITHUB_OUTPUT"
+          else
+            echo "resolved_env=stage" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Compile-check all Python modules
+        run: |
+          python3 -m compileall -q src scripts
+
+  deploy-stage:
+    name: Build & Push Stage (:stage-cpu)
+    needs: validate
+    if: needs.validate.outputs.resolved_env == 'stage'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Ensure models directory exists for Docker context
+        run: mkdir -p models
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_GHA_ROLE_ARN || 'arn:aws:iam::226259226741:role/growroute-github-ecr-deploy-role' }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Compute Stage image tags
+        id: meta
+        run: |
+          REGISTRY="${{ steps.login-ecr.outputs.registry }}"
+          SHORT_SHA="${GITHUB_SHA::7}"
+          echo "tags=${REGISTRY}/${ECR_REPOSITORY}:stage-cpu,${REGISTRY}/${ECR_REPOSITORY}:stage,${REGISTRY}/${ECR_REPOSITORY}:sha-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push amd64 Stage CPU image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.cpu
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha,scope=ml-stage-cpu
+          cache-to: type=gha,mode=max,scope=ml-stage-cpu
+
+      - name: Zero-Idle-Cost Stage EC2 Check & Conditional Rollout
+        run: |
+          STATE=$(aws ec2 describe-instances \
+            --instance-ids "$STAGE_INSTANCE_ID" \
+            --query "Reservations[0].Instances[0].State.Name" \
+            --output text)
+
+          if [ "$STATE" != "running" ]; then
+            echo "Stage EC2 ($STAGE_INSTANCE_ID) is '$STATE' ($0/hr); new :stage-cpu image will be pulled on next SQS autowake."
+            exit 0
+          fi
+
+          P_URL="https://sqs.${AWS_REGION}.amazonaws.com/${AWS_ACCOUNT_ID}/growroute-stage-parcel-jobs"
+          M_URL="https://sqs.${AWS_REGION}.amazonaws.com/${AWS_ACCOUNT_ID}/growroute-stage-ml-jobs"
+          P_ACTIVE=$(aws sqs get-queue-attributes --queue-url "$P_URL" --attribute-names ApproximateNumberOfMessages ApproximateNumberOfMessagesNotVisible --query "to_number(Attributes.ApproximateNumberOfMessages) + to_number(Attributes.ApproximateNumberOfMessagesNotVisible)" --output text 2>/dev/null || echo "0")
+          M_ACTIVE=$(aws sqs get-queue-attributes --queue-url "$M_URL" --attribute-names ApproximateNumberOfMessages ApproximateNumberOfMessagesNotVisible --query "to_number(Attributes.ApproximateNumberOfMessages) + to_number(Attributes.ApproximateNumberOfMessagesNotVisible)" --output text 2>/dev/null || echo "0")
+          TOTAL_ACTIVE=$(( ${P_ACTIVE%.*} + ${M_ACTIVE%.*} ))
+
+          if [ "$TOTAL_ACTIVE" -gt 0 ]; then
+            echo "::notice::Stage EC2 is running with ${TOTAL_ACTIVE} active SQS job(s); skipping live restart to protect in-flight shards."
+            exit 0
+          fi
+
+          PING=$(aws ssm describe-instance-information \
+            --filters "Key=InstanceIds,Values=${STAGE_INSTANCE_ID}" \
+            --query "InstanceInformationList[0].PingStatus" \
+            --output text)
+          if [ "$PING" != "Online" ]; then
+            echo "::warning::Stage EC2 SSM PingStatus is '$PING'; skipping live restart."
+            exit 0
+          fi
+
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "$STAGE_INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Roll growroute-ml-engine:stage-cpu (${GITHUB_SHA::7})" \
+            --parameters 'commands=["if systemctl list-unit-files | grep -q \"^growroute-workers.service\"; then systemctl restart growroute-workers.service; elif [ -f /opt/growroute/docker-compose.stage.yml ]; then sudo -u ubuntu -H bash -lc \"docker compose --env-file /opt/growroute/.env -f /opt/growroute/docker-compose.stage.yml pull ml-worker && docker compose --env-file /opt/growroute/.env -f /opt/growroute/docker-compose.stage.yml up -d --no-deps ml-worker\"; fi"]' \
+            --query "Command.CommandId" \
+            --output text)
+          echo "Dispatched Stage SSM rollout: $CMD_ID"
+
+  deploy-prod:
+    name: Promote & Push Production (:prod-cpu)
+    needs: validate
+    if: needs.validate.outputs.resolved_env == 'prod'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Ensure models directory exists for Docker context
+        run: mkdir -p models
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_GHA_ROLE_ARN || 'arn:aws:iam::226259226741:role/growroute-github-ecr-deploy-role' }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Compute Production release image tags
+        id: meta
+        run: |
+          REGISTRY="${{ steps.login-ecr.outputs.registry }}"
+          SHORT_SHA="${GITHUB_SHA::7}"
+          REL_DATE=$(date -u +%Y%m%d)
+          echo "tags=${REGISTRY}/${ECR_REPOSITORY}:prod-cpu,${REGISTRY}/${ECR_REPOSITORY}:prod,${REGISTRY}/${ECR_REPOSITORY}:release-${REL_DATE}-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push amd64 Production CPU image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.cpu
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha,scope=ml-prod-cpu
+          cache-to: type=gha,mode=max,scope=ml-prod-cpu
+
+      - name: Zero-Idle-Cost Prod EC2 Check & Safe SSM Restart
+        run: |
+          STATE=$(aws ec2 describe-instances \
+            --instance-ids "$PROD_INSTANCE_ID" \
+            --query "Reservations[0].Instances[0].State.Name" \
+            --output text)
+
+          if [ "$STATE" = "stopped" ] || [ "$STATE" != "running" ]; then
+            echo "EC2 is stopped ($0/hr); new :prod image will be pulled automatically by start_workers.sh on next SQS autowake"
+            exit 0
+          fi
+
+          PARCEL_Q="https://sqs.${AWS_REGION}.amazonaws.com/${AWS_ACCOUNT_ID}/growroute-prod-parcel-jobs"
+          ML_Q="https://sqs.${AWS_REGION}.amazonaws.com/${AWS_ACCOUNT_ID}/growroute-prod-ml-jobs"
+
+          P_COUNTS=$(aws sqs get-queue-attributes \
+            --queue-url "$PARCEL_Q" \
+            --attribute-names ApproximateNumberOfMessages ApproximateNumberOfMessagesNotVisible \
+            --query "[Attributes.ApproximateNumberOfMessages, Attributes.ApproximateNumberOfMessagesNotVisible]" \
+            --output text)
+          M_COUNTS=$(aws sqs get-queue-attributes \
+            --queue-url "$ML_Q" \
+            --attribute-names ApproximateNumberOfMessages ApproximateNumberOfMessagesNotVisible \
+            --query "[Attributes.ApproximateNumberOfMessages, Attributes.ApproximateNumberOfMessagesNotVisible]" \
+            --output text)
+
+          read -r P_VIS P_INF <<< "$P_COUNTS"
+          read -r M_VIS M_INF <<< "$M_COUNTS"
+          TOTAL_ACTIVE=$(( P_VIS + P_INF + M_VIS + M_INF ))
+
+          if [ "$TOTAL_ACTIVE" -gt 0 ]; then
+            echo "::notice::Prod EC2 ($PROD_INSTANCE_ID) has active SQS jobs (parcel=${P_VIS}+${P_INF}, ml=${M_VIS}+${M_INF}). Skipping live restart so in-flight shards are never interrupted."
+            exit 0
+          fi
+
+          PING=$(aws ssm describe-instance-information \
+            --filters "Key=InstanceIds,Values=${PROD_INSTANCE_ID}" \
+            --query "InstanceInformationList[0].PingStatus" \
+            --output text)
+          if [ "$PING" != "Online" ]; then
+            echo "::warning::Prod EC2 ($PROD_INSTANCE_ID) is running but SSM PingStatus is '$PING'. Skipping restart."
+            exit 0
+          fi
+
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "$PROD_INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Restart growroute-workers.service with new :prod-cpu ML image (${GITHUB_SHA::7})" \
+            --parameters 'commands=["systemctl restart growroute-workers.service"]' \
+            --query "Command.CommandId" \
+            --output text)
+
+          echo "Dispatched Prod SSM restart: $CMD_ID"
+          for i in $(seq 1 30); do
+            sleep 4
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$CMD_ID" \
+              --instance-id "$PROD_INSTANCE_ID" \
+              --query "Status" \
+              --output text 2>/dev/null || echo "Pending")
+            if [[ "$STATUS" == "Success" || "$STATUS" == "Failed" || "$STATUS" == "Cancelled" || "$STATUS" == "TimedOut" ]]; then
+              break
+            fi
+          done
+
+          if [ "$STATUS" != "Success" ]; then
+            echo "::error::Prod SSM restart failed with status: $STATUS"
+            exit 1
+          fi
+          echo "Successfully restarted growroute-workers.service on idle Prod EC2."
