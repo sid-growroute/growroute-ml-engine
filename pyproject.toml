@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "growroute-ml-engine"
+version = "0.2.0"
+description = "GrowRoute aerial NAIP pool/spa computer vision inference and CAD-guided dataset generation engine"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "boto3>=1.34.0",
+    "h3>=3.7.7,<4.0.0",
+    "numpy>=1.26.0",
+    "pyarrow>=15.0.0",
+    "pyproj>=3.6.1",
+    "python-dotenv>=1.0.1",
+    "pyyaml>=6.0.1",
+    "rasterio>=1.3.10",
+    "requests>=2.31.0",
+    "shapely>=2.0.4",
+    "supabase>=2.7.0",
+    "tqdm>=4.66.0",
+]
+
+[project.optional-dependencies]
+training = [
+    "psycopg[binary]>=3.1.18",
+    "boto3>=1.34.0",
+    "h3>=3.7.7,<4.0.0",
+    "numpy>=1.26.0",
+    "pandas>=2.1.0",
+    "pyarrow>=15.0.0",
+    "pillow>=10.2.0",
+    "pyproj>=3.6.1",
+    "rasterio>=1.3.10",
+    "shapely>=2.0.4",
+    "tqdm>=4.66.0",
+]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[project.scripts]
+growroute-training = "training.cli:main"
+
+[tool.setuptools]
+packages = ["src", "src.detectors", "src.io", "src.utils", "training"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
